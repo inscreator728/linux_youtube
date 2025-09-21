@@ -1,123 +1,261 @@
 #!/usr/bin/env python3
 """
-LRD — Legendary Rogue Downloader
-Hacker Edition (yt-dlp backend)
+LRD Downloader Professional (Playlist Auto-Folders + File Size)
+Author: LRD-SOUL
 
 Features:
-- Auto clipboard monitoring (copy a YouTube URL → instant download)
-- Hacker-styled neon console output
-- Supports single videos, playlists, audio-only, video+audio
-- Auto resume, retries, metadata saving
-- Organized folders: ~/LRD/Playlists and ~/LRD/Single_Videos
+- Numbered + command-based menu system
+- Clipboard watcher with custom folder name
+- Single or playlist download (playlist auto in its own folder with playlist title)
+- Best quality downloads with ffmpeg merging (if installed)
+- Cookie authentication support (browser or manual file)
+- File size detection (shows total size while downloading)
+- Settings persistence in config.json
+- Rich logging and progress
 """
 
 import os
 import sys
 import time
+import json
 import pyperclip
-from pathlib import Path
-from rich.console import Console
-from rich.panel import Panel
 import yt_dlp
+from rich.console import Console
+from rich.table import Table
+from pathlib import Path
 
-# -------------------------------
-# Setup
-# -------------------------------
 console = Console()
-base_dir = Path.home() / "LRD"
-base_dir.mkdir(parents=True, exist_ok=True)
 
-banner = r"""
-██╗     ██████╗ ██████╗ 
-██║     ██╔══██╗██╔══██╗
-██║     ██║  ██║██████╔╝
-██║     ██║  ██║██╔═══╝ 
-███████╗██████╔╝██║     
-╚══════╝╚═════╝ ╚═╝     
- LEGENDARY ROGUE DOWNLOADER
- Hacker Edition 🚀
-"""
+# ========================= CONFIG =============================
+BASE_OUTPUT = os.path.join(os.getcwd(), "LRD_Downloads")
+DB_FILE = os.path.join(BASE_OUTPUT, "downloaded.json")
+CONFIG_FILE = os.path.join(BASE_OUTPUT, "config.json")
 
-console.print(Panel(banner, style="bold green", expand=False))
+# Ensure directories exist
+os.makedirs(BASE_OUTPUT, exist_ok=True)
 
-# -------------------------------
-# Helpers
-# -------------------------------
+# Download history database
+if os.path.exists(DB_FILE):
+    with open(DB_FILE, "r") as f:
+        downloaded_db = json.load(f)
+else:
+    downloaded_db = {}
+
+def save_db():
+    with open(DB_FILE, "w") as f:
+        json.dump(downloaded_db, f, indent=2)
+
+# Config (cookies)
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {"cookies_from_browser": None, "cookies_file": None}
+
+config = load_config()
+
+def save_config():
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+# ========================= HELPERS ============================
 def sanitize(name: str) -> str:
-    return "".join(c for c in name if c.isalnum() or c in " _-").strip()
+    return "".join(c for c in name if c.isalnum() or c in " _-.").strip()
+
+# ========================= LOGGER ==============================
+class YTDLPLogger:
+    def debug(self, msg):
+        pass
+    def warning(self, msg):
+        console.print(f"[yellow][WARN][/yellow] {msg}")
+    def error(self, msg):
+        console.print(f"[red][ERROR][/red] {msg}")
+
+# ========================= PROGRESS HOOK =======================
+def human_size(bytes_str):
+    try:
+        size = float(bytes_str)
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if size < 1024:
+                return f"{size:.2f} {unit}"
+            size /= 1024
+    except:
+        return "?"
 
 def progress_hook(d):
     if d["status"] == "downloading":
-        pct = d.get("_percent_str", "").strip()
+        percent = d.get("_percent_str", "").strip()
         speed = d.get("_speed_str", "").strip()
         eta = d.get("_eta_str", "").strip()
-        console.print(f"[cyan]↓ {d.get('filename','')[:50]}[/cyan] {pct} {speed} ETA:{eta}", end="\r")
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        total_size = human_size(total) if total else "?"
+        console.print(
+            f"[cyan]Downloading:[/cyan] {percent} | {speed} | ETA: {eta} | Size: {total_size}",
+            end="\r"
+        )
     elif d["status"] == "finished":
-        console.print(f"\n[green]✓ Finished:[/green] {d.get('filename')}")
+        console.print("\n[green]Download complete, now processing...[/green]")
 
-def download_url(url: str, mode: str = "best"):
-    """
-    mode = best | audio | video
-    """
-    out_dir = base_dir / ("Playlists" if "playlist" in url.lower() else "Single_Videos")
-    out_dir.mkdir(parents=True, exist_ok=True)
+# ========================= YT-DLP CONFIG =======================
+def get_ydl_opts(outdir, mode="best"):
+    fmt = {
+        "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "audio": "bestaudio/best",
+        "video": "bestvideo+bestaudio/best",
+    }.get(mode, "best")
 
     opts = {
-        "outtmpl": str(out_dir / "%(playlist_index)03d - %(title).200s.%(ext)s"),
-        "ignoreerrors": True,
+        "format": fmt,
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(outdir, "%(title)s.%(ext)s"),
         "noplaylist": False,
-        "continuedl": True,
-        "retries": 5,
         "progress_hooks": [progress_hook],
         "quiet": True,
+        "logger": YTDLPLogger(),
     }
 
+    # Add cookie settings if configured
+    if config.get("cookies_from_browser"):
+        opts["cookiesfrombrowser"] = (config["cookies_from_browser"],)
+    elif config.get("cookies_file"):
+        opts["cookiefile"] = config["cookies_file"]
+
+    # Audio post-processing
     if mode == "audio":
-        opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
-    elif mode == "video":
-        opts["format"] = "bestvideo+bestaudio/best"
-    else:
-        opts["format"] = "best"
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+    return opts
 
-    console.print(f"[bold green]✔ LRD completed[/bold green] → {out_dir}")
+# ========================= DOWNLOADERS =========================
+def download_url(url, outdir, mode="best"):
+    os.makedirs(outdir, exist_ok=True)
+    opts = get_ydl_opts(outdir, mode)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+            # Handle playlist auto-folder
+            if info and info.get("_type") == "playlist":
+                playlist_title = sanitize(info.get("title", "Playlist"))
+                outdir = os.path.join(BASE_OUTPUT, playlist_title)
+                os.makedirs(outdir, exist_ok=True)
+                opts = get_ydl_opts(outdir, mode)
+                with yt_dlp.YoutubeDL(opts) as sub_ydl:
+                    sub_ydl.download([url])
+
+            title = info.get("title") if info else url
+            downloaded_db[url] = title
+            save_db()
+            console.print(f"[bold green]Downloaded:[/bold green] {title}")
+    except Exception as e:
+        console.print(f"[red]Download failed:[/red] {e}")
 
 
-# -------------------------------
-# Clipboard Watcher
-# -------------------------------
-def clipboard_watcher():
-    console.print("[yellow]LRD Clipboard Watcher active...[/yellow]")
-    last_clip = ""
+def clipboard_watch(name):
+    console.print(f"[blue]Watching clipboard... Saving into {name}[/blue]")
+    last = ""
     while True:
         try:
             clip = pyperclip.paste().strip()
-            if clip != last_clip and ("youtube.com" in clip or "youtu.be" in clip):
-                console.print(f"\n[magenta]⚡ LRD detected new URL:[/magenta] {clip}")
-                download_url(clip, mode="best")
-                last_clip = clip
+            if clip.startswith("http") and clip != last:
+                last = clip
+                if clip in downloaded_db:
+                    console.print("[yellow]Already downloaded, skipping[/yellow]")
+                else:
+                    outdir = os.path.join(BASE_OUTPUT, name)
+                    download_url(clip, outdir)
+            time.sleep(2)
         except KeyboardInterrupt:
-            console.print("\n[red]🛑 LRD stopped by user[/red]")
+            console.print("\n[red]Stopped clipboard watcher[/red]")
             break
-        except Exception as e:
-            console.print(f"[red]LRD Error:[/red] {e}")
-        time.sleep(2)
+
+# ========================= MENU ================================
+def show_help():
+    table = Table(title="LRD Downloader Professional")
+    table.add_column("No", justify="right")
+    table.add_column("Command", style="cyan")
+    table.add_column("Description", style="green")
+
+    table.add_row("1", "help", "Show this help menu")
+    table.add_row("2", "watch <name>", "Start clipboard watcher in <name> folder")
+    table.add_row("3", "download", "Download single or playlist (auto folder naming)")
+    table.add_row("4", "settings", "Configure cookies for login")
+    table.add_row("5", "exit", "Exit the app")
+
+    console.print(table)
 
 
-# -------------------------------
-# Main
-# -------------------------------
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        url = sys.argv[1]
-        mode = sys.argv[2] if len(sys.argv) > 2 else "best"
-        download_url(url, mode)
+def handle_download():
+    choice = console.input("Download single or playlist? (s/p): ").lower()
+    url = console.input("Enter the video/playlist URL: ").strip()
+    if choice == "s":
+        outdir = BASE_OUTPUT
     else:
-        clipboard_watcher()
+        outdir = os.path.join(BASE_OUTPUT, "Playlists")
+        os.makedirs(outdir, exist_ok=True)
+    download_url(url, outdir)
+
+
+def handle_settings():
+    console.print("[magenta]Settings - Configure authentication[/magenta]")
+    console.print("1) Use browser cookies")
+    console.print("2) Use cookies.txt file")
+    console.print("3) Clear authentication")
+    choice = console.input("Choose option: ").strip()
+
+    if choice == "1":
+        browser = console.input("Enter browser name (chrome/firefox/edge/brave): ").strip().lower()
+        config["cookies_from_browser"] = browser
+        config["cookies_file"] = None
+        save_config()
+        console.print(f"[green]Now using cookies from {browser}[/green]")
+    elif choice == "2":
+        path = console.input("Enter full path to cookies.txt: ").strip()
+        if os.path.exists(path):
+            config["cookies_file"] = path
+            config["cookies_from_browser"] = None
+            save_config()
+            console.print(f"[green]Now using cookies from file: {path}[/green]")
+        else:
+            console.print("[red]File not found![/red]")
+    elif choice == "3":
+        config["cookies_file"] = None
+        config["cookies_from_browser"] = None
+        save_config()
+        console.print("[yellow]Authentication cleared[/yellow]")
+    else:
+        console.print("[red]Invalid option[/red]")
+
+# ========================= MAIN LOOP ===========================
+def main():
+    console.print("[bold magenta]Welcome to LRD Downloader Professional[/bold magenta]")
+    show_help()
+    while True:
+        cmd = console.input("[bold blue]LRD> [/bold blue]").strip().split()
+        if not cmd:
+            continue
+        base = cmd[0].lower()
+
+        if base in ["1", "help"]:
+            show_help()
+        elif base in ["2", "watch"]:
+            if len(cmd) < 2:
+                console.print("[red]Usage: watch <foldername>[/red]")
+            else:
+                clipboard_watch(cmd[1])
+        elif base in ["3", "download"]:
+            handle_download()
+        elif base in ["4", "settings"]:
+            handle_settings()
+        elif base in ["5", "exit"]:
+            console.print("[yellow]Exiting... Goodbye![/yellow]")
+            break
+        else:
+            console.print("[red]Unknown command. Type 'help' or '1'.[/red]")
+
+if __name__ == "__main__":
+    main()
